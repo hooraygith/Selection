@@ -1,3 +1,11 @@
+# Fork from https://github.com/pot-app/Selection
+
+
+Fix performance issues on macOS
+
+
+
+
 # Selection
 
 Get the text selected by the cursor

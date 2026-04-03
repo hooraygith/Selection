@@ -1,40 +1,59 @@
 use accessibility_ng::{AXAttribute, AXUIElement};
 use accessibility_sys_ng::{kAXFocusedUIElementAttribute, kAXSelectedTextAttribute};
 use core_foundation::string::CFString;
+use core_graphics::event::{CGEvent, CGEventFlags, CGKeyCode};
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use log::{error, info};
+use objc::runtime::Object;
 use std::error::Error;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub fn get_text() -> String {
+    // 1. 获取当前前台活跃的 App 包名
+    let active_app_bundle_id = get_active_app_bundle_id().unwrap_or_default();
+
+    // 2. 定义黑名单 (已知 AX 查询极慢或经常卡死的应用)
+    let blacklist = vec![
+        "com.google.Chrome",
+        "com.microsoft.VSCode",
+        "md.obsidian",
+        "com.microsoft.edgemac",
+        "com.brave.Browser",
+        "com.avast.browser",
+        "org.bitbrowser.BitBrowser",
+        "org.chromium.Chromium",
+    ];
+
+    info!("===========当前活跃 App: {}===========", active_app_bundle_id);
+
+    // 3. 命中黑名单，直接走最高效的原生剪贴板方案
+    if blacklist.contains(&active_app_bundle_id.as_str()) {
+        info!("命中黑名单，跳过 AX API，直接执行原生 Cmd+C");
+        return get_text_by_native_cmd_c();
+    }
+
+    // 4. 白名单应用：优先尝试优雅的 Accessibility API
+    info!("尝试使用 Accessibility API 获取选中文本");
     match get_selected_text_by_ax() {
         Ok(text) => {
             if !text.is_empty() {
                 return text;
             } else {
-                info!("get_selected_text_by_ax is empty");
+                info!("AX API 返回空字符串");
             }
         }
         Err(err) => {
-            error!("get_selected_text_by_ax error:{}", err);
+            error!("AX API 失败: {}", err);
         }
     }
-    info!("fallback to get_text_by_clipboard");
-    match get_text_by_clipboard() {
-        Ok(text) => {
-            if !text.is_empty() {
-                return text;
-            } else {
-                info!("get_text_by_clipboard is empty");
-            }
-        }
-        Err(err) => {
-            error!("get_text_by_clipboard error:{}", err);
-        }
-    }
-    // Return Empty String
-    String::new()
+
+    // 5. 终极兜底：原生 Cmd+C
+    info!("AX 失败，Fallback 到原生 Cmd+C");
+    get_text_by_native_cmd_c()
 }
 
-// Copy from https://github.com/yetone/get-selected-text/blob/main/src/macos.rs
+// 原有的 Accessibility API 获取文本实现
 fn get_selected_text_by_ax() -> Result<String, Box<dyn Error>> {
     let system_element = AXUIElement::system_wide();
     let Some(selected_element) = system_element
@@ -66,54 +85,72 @@ fn get_selected_text_by_ax() -> Result<String, Box<dyn Error>> {
     Ok(selected_text.to_string())
 }
 
-fn get_text_by_clipboard() -> Result<String, Box<dyn Error>> {
-    let output = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(APPLE_SCRIPT)
-        .output()?;
-    // check exit code
-    if output.status.success() {
-        // get output content
-        let content = String::from_utf8(output.stdout)?;
-        Ok(content)
-    } else {
-        Err(format!("{output:?}").into())
+// 获取当前活动窗口的 Bundle ID
+fn get_active_app_bundle_id() -> Option<String> {
+    unsafe {
+        let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let front_app: *mut Object = msg_send![workspace, frontmostApplication];
+        if front_app.is_null() {
+            return None;
+        }
+
+        let bundle_id_nsstring: *mut Object = msg_send![front_app, bundleIdentifier];
+        if bundle_id_nsstring.is_null() {
+            return None;
+        }
+
+        let utf8_chars: *const i8 = msg_send![bundle_id_nsstring, UTF8String];
+        let c_str = std::ffi::CStr::from_ptr(utf8_chars);
+        Some(c_str.to_string_lossy().into_owned())
     }
 }
 
-const APPLE_SCRIPT: &str = r#"
-use AppleScript version "2.4"
-use scripting additions
-use framework "Foundation"
-use framework "AppKit"
+// 使用原生 API 触发 Cmd+C 并轮询剪贴板
+fn get_text_by_native_cmd_c() -> String {
+    unsafe {
+        let pasteboard: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
+        let initial_change_count: isize = msg_send![pasteboard, changeCount];
 
-set savedAlertVolume to alert volume of (get volume settings)
+        simulate_cmd_c();
 
--- Back up clipboard contents:
-set savedClipboard to the clipboard
+        let timeout = Duration::from_millis(150);
+        let start_time = Instant::now();
 
-set thePasteboard to current application's NSPasteboard's generalPasteboard()
-set theCount to thePasteboard's changeCount()
+        while start_time.elapsed() < timeout {
+            let current_change_count: isize = msg_send![pasteboard, changeCount];
 
-tell application "System Events"
-    set volume alert volume 0
-end tell
+            if current_change_count > initial_change_count {
+                let ns_string_class = class!(NSString);
+                let string_type: *mut Object = msg_send![ns_string_class, stringWithUTF8String: b"public.utf8-plain-text\0".as_ptr()];
 
--- Copy selected text to clipboard:
-tell application "System Events" to keystroke "c" using {command down}
-delay 0.1 -- Without this, the clipboard may have stale data.
+                let content: *mut Object = msg_send![pasteboard, stringForType: string_type];
 
-tell application "System Events"
-    set volume alert volume savedAlertVolume
-end tell
+                if !content.is_null() {
+                    let utf8_chars: *const i8 = msg_send![content, UTF8String];
+                    let c_str = std::ffi::CStr::from_ptr(utf8_chars);
+                    return c_str.to_string_lossy().into_owned();
+                }
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
 
-if thePasteboard's changeCount() is theCount then
-    return ""
-end if
+        info!("原生 Cmd+C 获取剪贴板超时或未选中内容");
+        String::new()
+    }
+}
 
-set theSelectedText to the clipboard
+// 模拟发送 Cmd+C 按键事件
+fn simulate_cmd_c() {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).unwrap();
+    let key_c: CGKeyCode = 8;
 
-set the clipboard to savedClipboard
+    let key_down = CGEvent::new_keyboard_event(source.clone(), key_c, true).unwrap();
+    key_down.set_flags(CGEventFlags::CGEventFlagCommand);
 
-theSelectedText
-"#;
+    let key_up = CGEvent::new_keyboard_event(source, key_c, false).unwrap();
+    key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+
+    key_down.post(core_graphics::event::CGEventTapLocation::HID);
+    key_up.post(core_graphics::event::CGEventTapLocation::HID);
+}

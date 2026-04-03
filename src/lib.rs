@@ -3,6 +3,9 @@
 // Created Date: 2023-06-04
 // Author: Pylogmon <pylogmon@outlook.com>
 
+#[macro_use]
+extern crate objc;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

@@ -23,9 +23,12 @@ pub fn get_text() -> String {
         "com.avast.browser",
         "org.bitbrowser.BitBrowser",
         "org.chromium.Chromium",
+        "ru.yandex.desktop.yandex-browser",
+        "com.tencent.xinWeChat",
+        "com.tencent.qq",
     ];
 
-    info!("===========当前活跃 App: {}===========", active_app_bundle_id);
+    info!("===========当前活跃 App: {} ===========", active_app_bundle_id);
 
     // 3. 命中黑名单，直接走最高效的原生剪贴板方案
     if blacklist.contains(&active_app_bundle_id.as_str()) {
